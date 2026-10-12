@@ -1,10 +1,9 @@
 # 🌲 The Escape
 
 A small 3D browser game built with A-Frame. You're lost in a dark, foggy swamp forest: find all 5 glowing orbs, reach the portal, and escape before the skeletons catch you.
+### ▶️ Play it here: [The Escape](https://amanihabib810-stack.github.io/A-Frame/)
 
 <img width="1606" height="1011" alt="Näyttökuva 2026-10-12 kello 12 43 30" src="https://github.com/user-attachments/assets/59d991cf-11c2-40f0-8ba0-f038b35c334c" />
-
-▶️ Play it here: [The Escape](https://amanihabib810-stack.github.io/A-Frame/)
 
 ### 🎮 How to play
 - Click Start Game.
