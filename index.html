@@ -1,0 +1,679 @@
+<html>
+  <head>
+    <script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
+    <script src="https://unpkg.com/aframe-environment-component@1.3.3/dist/aframe-environment-component.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/aframe-extras@7/dist/aframe-extras.min.js"></script>
+
+    <!-- ===== START / RESTART / HOME ===== -->
+    <script>
+      window.gameStarted = false;
+
+      // Ignore all keys until the game has started
+      window.addEventListener('keydown', function (e) {
+        if (!window.gameStarted) { e.stopImmediatePropagation(); }
+      }, true);
+      
+      // Show a subtitle for a few seconds
+      var sayTimer = null;
+      function say(text, ms) {
+        var box = document.getElementById('subtitle');
+        if (!box) { return; }
+        box.textContent = text;
+        box.style.opacity = 1;
+        clearTimeout(sayTimer);
+        sayTimer = setTimeout(function () { box.style.opacity = 0; }, ms || 3000);
+      }
+
+      // Pick one random line from a list
+      function sayRandom(lines, ms) {
+        say(lines[Math.floor(Math.random() * lines.length)], ms);
+      }
+
+      // Start button
+      function startGame() {
+        window.gameStarted = true;
+        document.getElementById('start-screen').style.display = 'none';
+        setTimeout(function () {
+          say('I have to collect these orbs before they catch me...', 4000);
+        }, 800);
+      }
+
+      // Play Again: reload and start right away
+      function restartGame() {
+        location.href = location.pathname + '?play';
+      }
+
+      // Home: reload and show the start screen
+      function goHome() {
+        location.href = location.pathname;
+      }
+
+      // If the address has ?play, skip the start screen
+      document.addEventListener('DOMContentLoaded', function () {
+        if (location.search.indexOf('play') !== -1) { startGame(); }
+      });
+    </script>
+
+    <!-- ===== PLAYER ANIMATIONS ===== -->
+    <script>
+      AFRAME.registerComponent('player-anims', {
+        init: function () {
+          var self = this;
+          this.keys = {};
+          this.mixer = null;
+          this.clips = [];
+          this.current = null;
+          this.currentClip = null;
+          this.busy = false;
+          this.running = false;
+          this.model = this.el.querySelector('[gltf-model]');
+
+          // Remember which keys are held down, and start actions
+          window.addEventListener('keydown', function (e) {
+            self.keys[e.code] = true;
+            if (!self.busy) {
+              if (e.code === 'KeyE') { self.grab(); }
+              if (e.code === 'Space') { e.preventDefault(); self.doAction(['roll']); }
+              if (e.code === 'KeyF') { self.doAction(['punch_right']); }
+              if (e.code === 'KeyQ') { self.doAction(['wave']); }
+            }
+          });
+
+          window.addEventListener('keyup', function (e) {
+            self.keys[e.code] = false;
+          });
+
+          // Set up the animations once the model is ready
+          function setup() {
+            var mesh = self.model.getObject3D('mesh');
+            self.clips = mesh.animations;
+            console.log('Animations:', self.clips.map(function (c) { return c.name; }));
+            self.mixer = new THREE.AnimationMixer(mesh);
+            self.mixer.addEventListener('finished', function () {
+              self.busy = false;
+              self.el.setAttribute('wasd-controls', 'enabled', true);
+            });
+          }
+
+          if (this.model.getObject3D('mesh')) {
+            setup();  // model already loaded
+          } else {
+            this.model.addEventListener('model-loaded', setup);  // wait for it
+          }
+        },
+
+        // Find an animation by name, e.g. 'run' finds "Run"
+        find: function (words) {
+          return findClip(this.clips, words);
+        },
+
+        // Smoothly switch to another animation
+        playClip: function (words, once) {
+          var clip = this.find(words);
+          if (!this.mixer || !clip || clip === this.currentClip) { return; }
+          var action = this.mixer.clipAction(clip);
+          action.reset();
+          action.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat);
+          action.clampWhenFinished = !!once;
+          action.fadeIn(0.2).play();
+          if (this.current) { this.current.fadeOut(0.2); }
+          this.current = action;
+          this.currentClip = clip;
+        },
+
+        // Pick-up animation
+        grab: function () {
+          this.doAction(['pickup', 'pick_up', 'interact', 'gather', 'grab']);
+        },
+
+        // Play a one-time action (roll, punch, wave...)
+        doAction: function (words) {
+          if (!this.find(words)) { return; }
+          this.busy = true;
+          this.el.setAttribute('wasd-controls', 'enabled', false);
+          this.playClip(words, true);
+        },
+
+        // Runs every frame: choose idle, walk or run
+        tick: function (time, delta) {
+          if (!this.mixer) { return; }
+          this.mixer.update(delta / 1000);
+          if (this.busy) { return; }
+
+          var k = this.keys;
+          var moving = k.KeyW || k.KeyA || k.KeyS || k.KeyD ||
+                       k.ArrowUp || k.ArrowDown || k.ArrowLeft || k.ArrowRight;
+          var running = !!(k.ShiftLeft || k.ShiftRight);
+
+          if (running !== this.running) {
+            this.running = running;
+            this.el.setAttribute('wasd-controls', 'acceleration', running ? 45 : 20);
+          }
+
+          if (moving) {
+            var dir = (k.KeyS || k.ArrowDown) ? 'back'
+                    : (k.KeyA || k.ArrowLeft) ? 'left'
+                    : (k.KeyD || k.ArrowRight) ? 'right' : 'forward';
+            if (running) {
+              this.playClip(dir === 'forward' ? ['run'] : ['run_' + dir]);
+            } else {
+              this.playClip(['walk']);
+            }
+          } else {
+            this.playClip(['idle']);
+          }
+        }
+      });
+    </script>
+
+    <!-- ===== ENEMIES + GAME RULES ===== -->
+    <script>
+      // Find an animation by name, e.g. 'run' finds "CharacterArmature|Run"
+      function findClip(clips, words) {
+        function base(c) { return c.name.split('|').pop().toLowerCase(); }
+        for (var i = 0; i < words.length; i++) {
+          for (var j = 0; j < clips.length; j++) {
+            if (base(clips[j]) === words[i]) { return clips[j]; }
+          }
+        }
+        for (var i = 0; i < words.length; i++) {
+          for (var j = 0; j < clips.length; j++) {
+            if (base(clips[j]).indexOf(words[i]) !== -1) { return clips[j]; }
+          }
+        }
+        return null;
+      }
+
+      // ---------- ENEMY: one skeleton ----------
+      AFRAME.registerComponent('enemy', {
+        init: function () {
+          var self = this;
+          this.player = document.querySelector('#player');
+          this.speed = 1.5 + Math.random();   // 1.5–2.5 meters per second
+          this.dead = false;
+          this.mixer = null;
+          this.clips = [];
+
+          this.el.addEventListener('model-loaded', function () {
+            var mesh = self.el.getObject3D('mesh');
+            self.clips = mesh.animations;
+            if (!window.enemyAnimsLogged) {
+              console.log('Enemy animations:', self.clips.map(function (c) { return c.name; }));
+              window.enemyAnimsLogged = true;
+            }
+            self.mixer = new THREE.AnimationMixer(mesh);
+            self.playAnim(['run', 'walk'], false);
+          });
+        },
+
+        playAnim: function (words, once) {
+          var clip = findClip(this.clips, words);
+          if (!this.mixer || !clip) { return; }
+          this.mixer.stopAllAction();
+          var action = this.mixer.clipAction(clip);
+          action.reset();
+          action.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat);
+          action.clampWhenFinished = !!once;
+          action.play();
+        },
+
+        die: function () {
+          if (this.dead) { return; }
+          this.dead = true;
+          this.el.classList.remove('enemy');
+          this.playAnim(['death'], true);
+          var el = this.el;
+          setTimeout(function () {
+            if (el.parentNode) { el.parentNode.removeChild(el); }
+          }, 2500);
+        },
+
+        tick: function (time, delta) {
+          delta = Math.min(delta, 100);
+          if (this.mixer) { this.mixer.update(delta / 1000); }
+          if (this.dead || !window.gameStarted) { return; }
+
+          var p = this.player.object3D.position;
+          var e = this.el.object3D.position;
+          var dx = p.x - e.x;
+          var dz = p.z - e.z;
+          var dist = Math.sqrt(dx * dx + dz * dz);
+
+          // Turn to face the player
+          this.el.object3D.rotation.y = Math.atan2(dx, dz);
+
+          // Walk toward the player, or attack when close enough
+          if (dist > 0.9) {
+            var step = this.speed * delta / 1000;
+            e.x += dx / dist * step;
+            e.z += dz / dist * step;
+          } else {
+            this.el.sceneEl.components.game.playerHit(this);
+          }
+        }
+      });
+
+      // ---------- GAME: orbs, portal, hearts, spawning ----------
+      AFRAME.registerComponent('game', {
+        init: function () {
+          var self = this;
+          this.player = document.querySelector('#player');
+          this.portal = document.querySelector('#portal');
+          this.hud = document.querySelector('#hud');
+          this.message = document.querySelector('#message');
+          this.total = document.querySelectorAll('.orb').length;
+          this.collected = 0;
+          this.allFound = false;
+          this.hearts = 3;
+          this.time = 0;
+          this.safeUntil = 0;       // no damage until this time
+          this.over = false;
+          this.spawnTimer = 7000;   // first skeletons appear 3 s after start
+          this.maxEnemies = 12;
+          this.updateHud();
+
+          window.addEventListener('keydown', function (e) {
+            if (e.code === 'KeyE') { self.tryCollect(); }
+            if (e.code === 'KeyF') { self.punch(); }
+          });
+        },
+
+        updateHud: function () {
+          var hearts = '❤️'.repeat(Math.max(this.hearts, 0));
+          var text = this.allFound
+            ? 'All orbs found! Find the portal!'
+            : 'Orbs: ' + this.collected + ' / ' + this.total;
+          this.hud.textContent = hearts + '   ' + text + '   ⏱ ' + Math.floor(this.time / 1000) + 's';
+        },
+
+        tryCollect: function () {
+          var p = this.player.object3D.position;
+          var orbs = document.querySelectorAll('.orb');
+          for (var i = 0; i < orbs.length; i++) {
+            var orb = orbs[i];
+            if (orb.object3D.position.distanceTo(p) < 1.5) {
+              orb.classList.remove('orb');
+              setTimeout(function (o) { o.parentNode.removeChild(o); }, 600, orb);
+              this.collected++;
+              if (this.collected === this.total) {
+                this.allFound = true;
+                this.portal.setAttribute('visible', true);
+              }
+              this.updateHud();
+              var left = this.total - this.collected;
+              if (this.allFound) {
+                say("That's all of them! Now where's that portal?", 4000);
+              } else {
+                sayRandom(['Got one! ' + left + ' more to go.',
+                           'Yes! Only ' + left + ' left.',
+                           'Another one... keep moving.']);
+              }
+              return;
+            }
+          }
+        },
+
+        // Punch: hit a skeleton right in front of the player
+        punch: function () {
+          var self = this;
+          setTimeout(function () {
+            var p = self.player.object3D.position;
+            var ry = self.player.object3D.rotation.y;
+            var fx = -Math.sin(ry);   // the direction the player is facing
+            var fz = -Math.cos(ry);
+            var enemies = document.querySelectorAll('.enemy');
+            for (var i = 0; i < enemies.length; i++) {
+              var e = enemies[i].object3D.position;
+              var dx = e.x - p.x;
+              var dz = e.z - p.z;
+              var dist = Math.sqrt(dx * dx + dz * dz);
+              if (dist < 1.8 && (dx * fx + dz * fz) / dist > 0.3) {
+                enemies[i].components.enemy.die();
+                sayRandom(['Take that!', 'Stay down!', 'Back off!'], 1500);
+              }
+            }
+          }, 250);   // wait for the fist to land
+        },
+
+        spawnEnemy: function () {
+          if (!this.warned) {
+            this.warned = true;
+            say('💀 "You can\'t escape the forest..."', 3000);
+            setTimeout(function () { say('Skeletons?! I need to hurry!'); }, 3200);
+          }
+          var p = this.player.object3D.position;
+          var angle = Math.random() * Math.PI * 2;
+          var r = 12 + Math.random() * 6;
+          var el = document.createElement('a-entity');
+          el.setAttribute('gltf-model', '#skeleton');
+          el.classList.add('enemy');
+          el.setAttribute('position', {
+            x: p.x + Math.sin(angle) * r,
+            y: 0,
+            z: p.z + Math.cos(angle) * r
+          });
+          el.setAttribute('enemy', '');
+          this.el.appendChild(el);
+        },
+
+        playerHit: function (enemy) {
+          if (this.over) { return; }
+          var now = performance.now();
+          if (now < this.safeUntil) { return; }
+
+          // Rolling = untouchable
+          var pa = this.player.components['player-anims'];
+          if (pa.busy && pa.currentClip &&
+              pa.currentClip.name.toLowerCase().indexOf('roll') !== -1) { return; }
+
+          this.hearts--;
+          this.safeUntil = now + 1500;
+          this.updateHud();
+
+          // Knock the skeleton back
+          var p = this.player.object3D.position;
+          var e = enemy.el.object3D.position;
+          var dx = e.x - p.x;
+          var dz = e.z - p.z;
+          var d = Math.sqrt(dx * dx + dz * dz) || 1;
+          e.x += dx / d * 2.5;
+          e.z += dz / d * 2.5;
+
+          if (this.hearts <= 0) {
+            this.gameOver();
+          } else {
+            pa.doAction(['hitrecieve']);
+            if (this.hearts === 1) {
+              say("I can't take another hit!");
+            } else {
+              say('Ouch! Get away from me!');
+          }
+        }
+      },
+
+        gameOver: function () {
+          var self = this;
+          this.over = true;
+          window.gameStarted = false;
+          var pa = this.player.components['player-anims'];
+          pa.doAction(['death']);
+          pa.playClip = function () {};   // freeze: no more animation changes
+          setTimeout(function () {
+            self.showEnd('You were caught! 💀', 'The skeletons got you. Try again?');
+          }, 2000);
+        },
+
+        showEnd: function (title, text) {
+          document.getElementById('message-title').textContent = title;
+          document.getElementById('message-text').textContent = text;
+          this.hud.style.display = 'none';
+          this.message.style.display = 'flex';
+        },
+
+        tick: function (time, delta) {
+          if (this.over || !window.gameStarted) { return; }
+          delta = Math.min(delta, 100);
+          this.time += delta;
+          this.updateHud();
+
+          // Spawn 2 skeletons every 10 seconds
+          this.spawnTimer += delta;
+          if (this.spawnTimer >= 10000) {
+            this.spawnTimer = 0;
+            for (var i = 0; i < 2; i++) {
+              if (document.querySelectorAll('.enemy').length < this.maxEnemies) {
+                this.spawnEnemy();
+              }
+            }
+          }
+
+          // Reached the open portal?
+          if (this.allFound) {
+            var p = this.player.object3D.position;
+            var q = this.portal.object3D.position;
+            var dx = p.x - q.x;
+            var dz = p.z - q.z;
+            if (Math.sqrt(dx * dx + dz * dz) < 1.5) {
+              this.over = true;
+              window.gameStarted = false;
+                  this.showEnd('You escaped! 🎉', 'You made it out in ' + Math.floor(this.time / 1000) + ' seconds!');
+            }
+          }
+        }
+      });
+    </script>
+
+    <!-- ===== TURNING WITH ARROWS ===== -->
+    <script>
+      AFRAME.registerComponent('arrow-turn', {
+        schema: {
+          speed: {default: 120}   // degrees per second
+        },
+        init: function () {
+          var self = this;
+          this.left = false;
+          this.right = false;
+          this.yaw = 0;
+
+          // Catch the left/right arrows before wasd-controls sees them,
+          // so they turn the player instead of stepping sideways
+          function handle(e, down) {
+            if (e.code === 'ArrowLeft')  { self.left = down;  e.stopPropagation(); }
+            if (e.code === 'ArrowRight') { self.right = down; e.stopPropagation(); }
+          }
+          window.addEventListener('keydown', function (e) { handle(e, true); }, true);
+          window.addEventListener('keyup',   function (e) { handle(e, false); }, true);
+        },
+
+        // Every frame: turn while an arrow is held down
+        tick: function (time, delta) {
+          var turn = 0;
+          if (this.left)  { turn += 1; }
+          if (this.right) { turn -= 1; }
+          if (turn === 0) { return; }
+          this.yaw += turn * this.data.speed * delta / 1000;
+          this.el.setAttribute('rotation', {x: 0, y: this.yaw, z: 0});
+        }
+      });
+    </script>
+    <script>
+  AFRAME.registerComponent('swamp-decor', {
+    schema: {
+      pools: {default: 25},       // how many glowing pools
+      fireflies: {default: 80},   // how many fireflies
+      size: {default: 40}         // spread them over -40..40 meters
+    },
+    init: function () {
+      var scene = this.el;
+      var s = this.data.size;
+      function rand(min, max) { return min + Math.random() * (max - min); }
+
+      // ----- Glowing pools: 2–3 stacked flat boxes each -----
+      for (var i = 0; i < this.data.pools; i++) {
+        var x = rand(-s, s);
+        var z = rand(-s, s);
+        if (Math.abs(x) < 3 && Math.abs(z) < 3) { continue; }  // keep start area clear
+
+        var pool = document.createElement('a-entity');
+        pool.setAttribute('position', x + ' 0.02 ' + z);
+
+        var layers = 2 + Math.floor(Math.random() * 2);
+        for (var j = 0; j < layers; j++) {
+          var b = document.createElement('a-box');
+          var w = rand(1.5, 3) * (1 - j * 0.3);   // each layer smaller
+          var color = (j === layers - 1) ? '#7DFFB0' : '#2FBF71';
+          b.setAttribute('width', w);
+          b.setAttribute('depth', w * rand(0.7, 1.2));
+          b.setAttribute('height', 0.05);
+          b.setAttribute('position', rand(-0.3, 0.3) + ' ' + (j * 0.04) + ' ' + rand(-0.3, 0.3));
+          b.setAttribute('rotation', '0 ' + rand(0, 90) + ' 0');
+          b.setAttribute('material', 'color: ' + color + '; emissive: ' + color +
+                         '; emissiveIntensity: ' + (0.6 + j * 0.3) +
+                         '; opacity: 0.85; transparent: true');
+          pool.appendChild(b);
+        }
+        scene.appendChild(pool);
+      }
+
+      // ----- Fireflies: tiny glowing boxes that drift -----
+      for (var k = 0; k < this.data.fireflies; k++) {
+        var fx = rand(-s, s);
+        var fy = rand(0.5, 3);
+        var fz = rand(-s, s);
+        var fly = document.createElement('a-box');
+        fly.setAttribute('width', 0.06);
+        fly.setAttribute('height', 0.06);
+        fly.setAttribute('depth', 0.06);
+        fly.setAttribute('position', fx + ' ' + fy + ' ' + fz);
+        fly.setAttribute('material', 'color: #B6FF6A; emissive: #B6FF6A; emissiveIntensity: 1');
+        fly.setAttribute('animation',
+          'property: position; to: ' + (fx + rand(-0.5, 0.5)) + ' ' + (fy + rand(0.3, 0.8)) + ' ' +
+          (fz + rand(-0.5, 0.5)) + '; dir: alternate; loop: true; easing: easeInOutSine; dur: ' +
+          Math.floor(rand(2000, 4000)));
+        scene.appendChild(fly);
+      }
+    }
+  });
+</script>
+  </head>
+
+  <body>
+    <a-scene game swamp-decor>
+      <a-assets>
+        <a-asset-item id="soldier" src="soldier.glb"></a-asset-item>
+        <a-asset-item id="skeleton" src="skeleton.glb"></a-asset-item>
+      </a-assets>
+
+      <a-entity cursor="rayOrigin: mouse"></a-entity>
+
+      <!-- Player: soldier + camera move together -->
+      <a-entity id="player" position="0 0 0" wasd-controls="acceleration: 20" player-anims arrow-turn>
+
+        <!-- Soldier by Quaternius [CC-BY] via Poly Pizza -->
+        <a-entity gltf-model="#soldier" rotation="0 180 0"></a-entity>
+
+        <!-- Camera: 1 m behind at head height, tilted slightly down -->
+        <a-entity camera position="0 1.8 1" rotation="-10 0 0"></a-entity>
+      <!-- Lantern light that follows the player -->
+       <a-entity light="type: point; color: #CFFFF0; intensity: 1.5; distance: 10" position="0 2.5 0.5"></a-entity>
+    </a-entity>
+       <a-entity light="type: ambient; color: #5FA8A0; intensity: 0.5"></a-entity>
+
+      <!-- Night forest -->
+      <a-entity environment="preset: forest; ground: flat; groundTexture: squares;
+      groundColor: #12302E; groundColor2: #0E2826;
+      skyType: gradient; skyColor: #06121A; horizonColor: #1A4048;
+      fog: 0.75; dressingAmount: 40; dressingColor: #1E3B32;
+      lightPosition: 0 0.4 -1"></a-entity>
+
+          <!-- Glowing orbs to collect -->
+      <a-sphere class="orb" radius="0.25" position="8 0.4 -10"
+                material="color: #7CF; emissive: #7CF; emissiveIntensity: 1"
+                animation="property: object3D.position.y; to: 0.7; dir: alternate; loop: true; dur: 1200">
+        <a-light type="point" color="#7CF" intensity="0.6" distance="4"></a-light>
+        <a-cylinder radius="0.04" height="10" position="0 5 0"
+            material="color: #7CF; shader: flat; opacity: 0.3; transparent: true"></a-cylinder>
+      </a-sphere>
+      <a-sphere class="orb" radius="0.25" position="-12 0.4 -6"
+                material="color: #7CF; emissive: #7CF; emissiveIntensity: 1"
+                animation="property: object3D.position.y; to: 0.7; dir: alternate; loop: true; dur: 1200">
+        <a-light type="point" color="#7CF" intensity="0.6" distance="4"></a-light>
+        <a-cylinder radius="0.04" height="10" position="0 5 0"
+            material="color: #7CF; shader: flat; opacity: 0.3; transparent: true"></a-cylinder>
+      </a-sphere>
+      <a-sphere class="orb" radius="0.25" position="15 0.4 12"
+                material="color: #7CF; emissive: #7CF; emissiveIntensity: 1"
+                animation="property: object3D.position.y; to: 0.7; dir: alternate; loop: true; dur: 1200">
+        <a-light type="point" color="#7CF" intensity="0.6" distance="4"></a-light>
+        <a-cylinder radius="0.04" height="10" position="0 5 0"
+            material="color: #7CF; shader: flat; opacity: 0.3; transparent: true"></a-cylinder>
+      </a-sphere>
+      <a-sphere class="orb" radius="0.25" position="-6 0.4 18"
+                material="color: #7CF; emissive: #7CF; emissiveIntensity: 1"
+                animation="property: object3D.position.y; to: 0.7; dir: alternate; loop: true; dur: 1200">
+        <a-light type="point" color="#7CF" intensity="0.6" distance="4"></a-light>
+        <a-cylinder radius="0.04" height="10" position="0 5 0"
+            material="color: #7CF; shader: flat; opacity: 0.3; transparent: true"></a-cylinder>
+      </a-sphere>
+      <a-sphere class="orb" radius="0.25" position="3 0.4 -22"
+                material="color: #7CF; emissive: #7CF; emissiveIntensity: 1"
+                animation="property: object3D.position.y; to: 0.7; dir: alternate; loop: true; dur: 1200">
+        <a-light type="point" color="#7CF" intensity="0.6" distance="4"></a-light>
+        <a-cylinder radius="0.04" height="10" position="0 5 0"
+            material="color: #7CF; shader: flat; opacity: 0.3; transparent: true"></a-cylinder>
+      </a-sphere>
+
+      <!-- Exit portal: hidden until all orbs are collected -->
+      <a-torus id="portal" position="0 1.5 -30" radius="1.2" radius-tubular="0.08"
+               material="color: #C77DFF; emissive: #C77DFF; emissiveIntensity: 1"
+               visible="false"
+               animation="property: rotation; to: 0 0 360; loop: true; dur: 4000; easing: linear">
+        <a-light type="point" color="#C77DFF" intensity="1.5" distance="8"></a-light>
+      </a-torus>
+    </a-scene>
+
+    <!-- Credit -->
+    <div style="position: fixed; bottom: 8px; left: 8px; color: white; font: 12px sans-serif; opacity: 0.7;">
+      <a href="https://poly.pizza/m/oAArCNHjFB" style="color: white;">Soldier</a>
+      by <a href="https://poly.pizza/u/Quaternius" style="color: white;">Quaternius</a>
+    </div>
+
+    <!-- Hearts + orb counter -->
+    <div id="hud" style="position: fixed; top: 12px; left: 12px; color: #7CF; font: bold 18px sans-serif;"></div>
+        <!-- Subtitles -->
+    <div id="subtitle" style="position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%);
+         max-width: 80%; padding: 10px 20px; border-radius: 8px; background: rgba(0, 0, 0, 0.6);
+         color: white; font: 20px sans-serif; text-align: center; z-index: 5000;
+         pointer-events: none; opacity: 0; transition: opacity 0.4s;"></div>
+
+    <!-- End screen (win or lose) -->
+    <div id="message" style="display: none; position: fixed; inset: 0; z-index: 10000;
+         flex-direction: column; align-items: center; justify-content: center;
+         background: rgba(5, 8, 20, 0.85); color: white; font-family: sans-serif; text-align: center;">
+
+      <h1 id="message-title" style="font-size: 56px; margin: 0; color: #C77DFF; text-shadow: 0 0 20px #C77DFF;">
+        You escaped! 🎉
+      </h1>
+      <p id="message-text" style="font-size: 18px;">You found all the orbs and made it out of the forest.</p>
+
+      <div style="margin-top: 20px;">
+        <button onclick="restartGame()" style="margin: 0 8px; padding: 14px 32px;
+                font-size: 18px; font-weight: bold; color: white; background: #7B2CBF;
+                border: none; border-radius: 30px; cursor: pointer; box-shadow: 0 0 20px #C77DFF;">
+          Play Again
+        </button>
+        <button onclick="goHome()" style="margin: 0 8px; padding: 14px 32px;
+                font-size: 18px; font-weight: bold; color: white; background: transparent;
+                border: 2px solid #C77DFF; border-radius: 30px; cursor: pointer;">
+          Home
+        </button>
+      </div>
+    </div>
+
+    <!-- Start screen -->
+    <div id="start-screen" style="position: fixed; inset: 0; z-index: 10000;
+         display: flex; flex-direction: column; align-items: center; justify-content: center;
+         background: rgba(5, 8, 20, 0.85); color: white; font-family: sans-serif; text-align: center;">
+
+      <h1 style="font-size: 56px; margin: 0; color: #C77DFF; text-shadow: 0 0 20px #C77DFF;">
+        The Escape
+      </h1>
+
+      <p style="font-size: 18px; max-width: 420px; line-height: 1.5;">
+        Find all 5 glowing orbs hidden in the dark forest,<br>
+        then reach the portal to escape. Watch out for skeletons!
+      </p>
+
+      <p style="font-size: 14px; opacity: 0.8; line-height: 1.8;">
+        W / S – walk &nbsp;·&nbsp; ← / → – turn &nbsp;·&nbsp; Shift – run<br>
+        E – pick up &nbsp;·&nbsp; F – punch &nbsp;·&nbsp; Space – roll (dodge) &nbsp;·&nbsp; Q – wave
+      </p>
+
+      <button onclick="startGame()" style="margin-top: 20px; padding: 14px 40px;
+              font-size: 20px; font-weight: bold; color: white; background: #7B2CBF;
+              border: none; border-radius: 30px; cursor: pointer; box-shadow: 0 0 20px #C77DFF;">
+        Start Game
+      </button>
+    </div>
+  </body>
+</html>
